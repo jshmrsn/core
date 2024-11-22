@@ -52,6 +52,16 @@ from homeassistant.helpers.typing import ConfigType
 from homeassistant.util.event_type import EventType
 from homeassistant.util.json import json_loads
 
+from homeassistant.components import websocket_api
+from homeassistant.components.websocket_api.connection import ActiveConnection
+import homeassistant.components.websocket_api.const as websocket_api_const
+import inspect
+
+async def maybe_await(obj):
+    if inspect.isawaitable(obj):
+        return await obj
+    return obj
+
 _LOGGER = logging.getLogger(__name__)
 
 ATTR_BASE_URL = "base_url"
@@ -85,11 +95,82 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     hass.http.register_view(APIDomainServicesView)
     hass.http.register_view(APIComponentsView)
     hass.http.register_view(APITemplateView)
+    hass.http.register_view(APIWebsocketProxyView)
 
     if DATA_LOGGING in hass.data:
         hass.http.register_view(APIErrorLog)
 
     return True
+
+class APIWebsocketProxyView(HomeAssistantView):
+    """View to handle websocket API proxy requests, which allows access to Websocket APIs via the REST API."""
+
+    url = "/api/websocket-proxy/{ws_api_prefix}/{ws_api}"
+    name = "api:websocket-proxy"
+
+    @ha.callback
+    def get(self, request: web.Request, entity_id: str) -> web.Response:
+        """Check API status."""
+        return self.json_message("Websocket proxy API get API reached.", HTTPStatus.OK)
+
+    async def post(self, request: web.Request, ws_api_prefix: str, ws_api: str) -> web.Response:
+        """Proxy an HTTP POST request as an websocket API request."""
+        user: User = request[KEY_HASS_USER]
+        if not user.is_admin:
+            raise Unauthorized(perm_category="websocket-proxy", permission=f"{ws_api_prefix}/{ws_api}")
+        hass = request.app[KEY_HASS]
+        try:
+            data = await request.json()
+        except ValueError:
+            return self.json_message("Invalid JSON specified.", HTTPStatus.BAD_REQUEST)
+        
+        domain = websocket_api_const.DOMAIN
+        _LOGGER.info(f"APIWebsocketProxyView: domain={domain}, ws_api_prefix={ws_api_prefix}, ws_api={ws_api}, data={str(data)}")
+        
+        handlers = hass.data.get(domain)
+        
+        if handlers is None:
+            return self.json_message("handlers not found.", HTTPStatus.BAD_REQUEST)
+        
+        command = f"{ws_api_prefix}/{ws_api}"
+        
+        handler_tuple = handlers.get(command)
+        
+        if handler_tuple is None:
+            return self.json_message(f"handler not found for command {command}.", HTTPStatus.BAD_REQUEST)
+        
+        handler: websocket_api_const.AsyncWebSocketCommandHandler = handler_tuple[0]
+        
+        class ProxyRefreshToken:
+            id: str = "websocket-proxy"
+        
+        sent_messages = []
+        
+        def proxy_send_message(data: bytes | str | dict[str, Any]):
+            sent_messages.append(data)
+            _LOGGER.info(f"Websocket proxy send message: {data}")
+        
+        active_connection = ActiveConnection(
+            logger=_LOGGER,
+            hass=hass,
+            send_message=proxy_send_message,
+            user=user,
+            refresh_token=ProxyRefreshToken()
+        )
+        
+        handler_result = handler(hass, active_connection, data)
+        await maybe_await(handler_result)
+        
+        status_code = HTTPStatus.OK
+        
+        resp = self.json({
+            "result": "ok",
+            "messages": sent_messages
+        }, status_code)
+
+        resp.headers.add("Location", f"/api/websocket-proxy/{ws_api_prefix}/{ws_api}")
+
+        return resp
 
 
 class APIStatusView(HomeAssistantView):
